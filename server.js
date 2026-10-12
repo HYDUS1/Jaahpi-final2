@@ -251,6 +251,7 @@ http.createServer(async (q, s) => {
       liveEdit(b.id, b.lat, b.lng);
       return send(s, 200, {});
     }
+    if (p.startsWith('/where/')) { const k = tracks[p.slice(7)]; return send(s, 200, k ? { ok: true, age: Math.round((Date.now() - k.t) / 1000) } : { ok: false }); }
     if (p.startsWith('/t/')) {
       const k = tracks[p.slice(3)];
       if (!k) return send(s, 404, '<meta http-equiv=refresh content=5><meta name=viewport content="width=device-width"><body style="font:18px sans-serif;padding:24px">Waiting for location… this page refreshes by itself. If it stays blank, the link has expired.</body>', 'text/html');
@@ -262,8 +263,9 @@ http.createServer(async (q, s) => {
     if ((p === '/config' || p === '/config/get') && q.method === 'POST') {
       const b = await body(q);
       if (limited('dev' + ip, 8) || !isDev(b.code)) return send(s, 403, { error: 'forbidden' });
-      const out = () => ({ ok: true, bot: botName, mode, botSet: !!TOKEN, webhookErr, ai: { provider: (cfg.ai || {}).provider || '', model: (cfg.ai || {}).model || '', baseUrl: (cfg.ai || {}).baseUrl || '', keySet: !!(cfg.ai && cfg.ai.key) } });
-      if (p === '/config/get') return send(s, 200, out());
+      const whInfo = async () => { if (!TOKEN) return null; const r = await tg('getWebhookInfo', {}, 1); return r.ok ? { set: !!r.result.url, pending: r.result.pending_update_count, lastError: r.result.last_error_message || '' } : null; };
+      const out = async () => ({ ok: true, bot: botName, mode, botSet: !!TOKEN, webhookErr, webhook: await whInfo(), ai: { provider: (cfg.ai || {}).provider || '', model: (cfg.ai || {}).model || '', baseUrl: (cfg.ai || {}).baseUrl || '', keySet: !!(cfg.ai && cfg.ai.key) } });
+      if (p === '/config/get') return send(s, 200, await out());
       let botRes = null;
       if (typeof b.botToken === 'string' && b.botToken.trim()) {
         const old = TOKEN; mode = 'off';
@@ -276,9 +278,23 @@ http.createServer(async (q, s) => {
         const a = b.ai, prev = cfg.ai || {};
         cfg.ai = { provider: ['gemini', 'openai', 'anthropic'].includes(a.provider) ? a.provider : (prev.provider || 'gemini'), model: String(a.model || prev.model || '').trim().slice(0, 100), baseUrl: String(a.baseUrl || '').trim().slice(0, 200), key: String(a.key || '').trim() || prev.key || '' };
         saveCfg();
-        if (b.test) { try { await ai({ mode: 'chat', lang: 'en', messages: [{ role: 'user', content: 'Say OK' }] }); } catch (e) { return send(s, 200, { ...out(), aiTest: 'FAILED: ' + String(e.message).slice(0, 160) }); } return send(s, 200, { ...out(), aiTest: 'OK' }); }
       }
-      return send(s, 200, { ...out(), botRes });
+      const res = { ...(await out()), botRes };
+      if (b.test) {
+        if (!aiReady()) res.aiTest = 'FAILED: AI is not set (model or key missing)';
+        else { try { await ai({ mode: 'chat', lang: 'en', messages: [{ role: 'user', content: 'Say OK' }] }); res.aiTest = 'OK'; } catch (e) { res.aiTest = 'FAILED: ' + String(e.message).slice(0, 220); } }
+      }
+      if (b.listModels && cfg.ai && cfg.ai.key) {
+        try {
+          const c = cfg.ai, g = (c.provider || 'gemini') === 'gemini';
+          const base = (c.baseUrl || (g ? 'https://generativelanguage.googleapis.com/v1beta' : c.provider === 'anthropic' ? 'https://api.anthropic.com/v1' : 'https://api.openai.com/v1')).replace(/\/$/, '');
+          const hd = g ? { 'x-goog-api-key': c.key } : c.provider === 'anthropic' ? { 'x-api-key': c.key, 'anthropic-version': '2023-06-01' } : { authorization: 'Bearer ' + c.key };
+          const r = await fetch(base + '/models' + (g ? '?pageSize=200' : ''), { headers: hd }); const j = await r.json();
+          const arr = (j.models || j.data || []).filter(m => !m.supportedGenerationMethods || m.supportedGenerationMethods.includes('generateContent')).map(m => String(m.name || m.id).replace(/^models\//, ''));
+          res.models = arr.filter(n => /flash|pro|sonnet|haiku|opus|gpt|mini|llama/i.test(n)).slice(0, 25);
+        } catch (e) { res.models = ['could not list: ' + String(e.message).slice(0, 100)]; }
+      }
+      return send(s, 200, res);
     }
     send(s, 404, { error: 'not found' });
   } catch (e) { log('server error', e); send(s, 500, { error: 'server' }); }
