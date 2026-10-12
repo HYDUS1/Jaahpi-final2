@@ -28,7 +28,7 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 /* ------------------------------------------------------------------ Telegram */
 const TG_BASE = process.env.TG_API || 'https://api.telegram.org/';
 let TOKEN = process.env.BOT_TOKEN || cfg.botToken || '';
-let botName = '', hook = '', webhookErr = '', mode = 'off';
+let botName = '', hook = '', webhookErr = '', mode = 'off', expectedHook = '';
 const hookOf = t => sha(t).slice(0, 24);
 
 async function tg(method, body, tries = 3) {
@@ -40,6 +40,7 @@ async function tg(method, body, tries = 3) {
       });
       const j = await r.json().catch(() => ({ ok: false, description: 'bad json ' + r.status }));
       if (j.ok) return j;
+      log('telegram', method, 'failed:', r.status, j.description || '');
       if (r.status === 429) { await sleep(((j.parameters && j.parameters.retry_after) || 1) * 1000 + 100); continue; }
       if (r.status >= 500) { await sleep(500 * (i + 1)); continue; }
       return j; // 4xx: do not retry (blocked bot, chat not found ...)
@@ -57,6 +58,7 @@ const unlink = chat => { let n = 0; for (const k in subs) { const a = subs[k].fi
 
 const seen = []; // dedupe update ids
 async function onUpdate(u) {
+  log('update', u.update_id, Object.keys(u).filter(k => k !== 'update_id').join(','));
   if (u.update_id != null) { if (seen.includes(u.update_id)) return; seen.push(u.update_id); if (seen.length > 500) seen.shift(); }
   const m = u.message || u.edited_message || (u.callback_query && u.callback_query.message);
   if (u.callback_query) tg('answerCallbackQuery', { callback_query_id: u.callback_query.id }, 1);
@@ -119,8 +121,19 @@ async function bootBot() {
   } else poll();
   tg('setMyCommands', { commands: [{ command: 'status', description: 'Am I linked?' }, { command: 'stop', description: 'Stop alerts' }, { command: 'help', description: 'Help' }] }, 1);
   log('bot ready @' + botName, 'mode=' + mode);
+  expectedHook = base ? `${base}/tg/${hook}` : '';
   return { ok: true, bot: botName };
 }
+
+// Self-heal: if some other server (an old deployment) re-registers the webhook for this bot, take it back.
+setInterval(async () => {
+  if (mode !== 'webhook' || !TOKEN || !expectedHook) return;
+  const r = await tg('getWebhookInfo', {}, 1);
+  if (r.ok && r.result.url !== expectedHook) {
+    log('webhook was changed to another address, restoring');
+    await tg('setWebhook', { url: expectedHook, secret_token: hook, max_connections: 20, allowed_updates: ['message', 'edited_message', 'callback_query'] });
+  }
+}, 120000);
 
 /* ---------------------------------------------------------------------- AI */
 const aiReady = () => !!(cfg.ai && cfg.ai.key && cfg.ai.model);
@@ -255,15 +268,15 @@ http.createServer(async (q, s) => {
     if (p.startsWith('/t/')) {
       const k = tracks[p.slice(3)];
       if (!k) return send(s, 404, '<meta http-equiv=refresh content=5><meta name=viewport content="width=device-width"><body style="font:18px sans-serif;padding:24px">Waiting for location… this page refreshes by itself. If it stays blank, the link has expired.</body>', 'text/html');
-      const d = .004, src = `https://www.openstreetmap.org/export/embed.html?bbox=${k.lng - d},${k.lat - d},${k.lng + d},${k.lat + d}&layer=mapnik&marker=${k.lat},${k.lng}`;
-      return send(s, 200, `<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=5><title>Live location</title><body style="margin:0;font:16px sans-serif"><div style="padding:12px;background:#0B1030;color:#fff"><b>${esc(k.name)}</b> · updated ${Math.round((Date.now() - k.t) / 1000)}s ago · <a style="color:#19D3F2" href="https://maps.google.com/?q=${k.lat},${k.lng}">Open in Maps</a></div><iframe src="${src}" style="border:0;width:100%;height:calc(100vh - 48px)"></iframe></body>`, 'text/html');
+      const src = `https://maps.google.com/maps?q=${k.lat},${k.lng}&z=17&output=embed`;
+      return send(s, 200, `<!doctype html><meta name=viewport content="width=device-width,initial-scale=1"><meta http-equiv=refresh content=6><title>Live location</title><body style="margin:0;font:16px sans-serif"><div style="padding:12px;background:#0B1030;color:#fff"><b>${esc(k.name)}</b> · updated ${Math.round((Date.now() - k.t) / 1000)}s ago<br><a style="display:inline-block;margin-top:8px;background:#19D3F2;color:#04122b;font-weight:700;padding:8px 14px;border-radius:99px;text-decoration:none" href="https://www.google.com/maps/search/?api=1&query=${k.lat},${k.lng}">Open in Google Maps</a></div><iframe src="${src}" style="border:0;width:100%;height:calc(100vh - 96px)"></iframe></body>`, 'text/html');
     }
 
     // ---- developer only: settings here apply to EVERY user of the app
     if ((p === '/config' || p === '/config/get') && q.method === 'POST') {
       const b = await body(q);
       if (limited('dev' + ip, 8) || !isDev(b.code)) return send(s, 403, { error: 'forbidden' });
-      const whInfo = async () => { if (!TOKEN) return null; const r = await tg('getWebhookInfo', {}, 1); return r.ok ? { set: !!r.result.url, pending: r.result.pending_update_count, lastError: r.result.last_error_message || '' } : null; };
+      const whInfo = async () => { if (!TOKEN) return null; const r = await tg('getWebhookInfo', {}, 1); return r.ok ? { set: !!r.result.url, host: (() => { try { return new URL(r.result.url).hostname; } catch (e) { return ''; } })(), pending: r.result.pending_update_count, lastError: r.result.last_error_message || '' } : null; };
       const out = async () => ({ ok: true, bot: botName, mode, botSet: !!TOKEN, webhookErr, webhook: await whInfo(), ai: { provider: (cfg.ai || {}).provider || '', model: (cfg.ai || {}).model || '', baseUrl: (cfg.ai || {}).baseUrl || '', keySet: !!(cfg.ai && cfg.ai.key) } });
       if (p === '/config/get') return send(s, 200, await out());
       let botRes = null;
