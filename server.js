@@ -12,6 +12,9 @@ const DEV_HASH = process.env.DEV_HASH || '07ae20918563b4a84e4458725d1b9f7296da63
 const read = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { return d; } };
 let subs = read(F_SUBS, {});            // code -> [chat ids]
 let cfg = read(F_CFG, {});              // { botToken, ai:{provider,model,key,baseUrl} }
+// Free hosting has no disk, so settings can also come from environment variables (they survive restarts):
+// AI_PROVIDER (gemini|openai|anthropic), AI_MODEL, AI_KEY, AI_BASE (optional)
+if (process.env.AI_KEY && process.env.AI_MODEL) cfg.ai = { provider: process.env.AI_PROVIDER || 'gemini', model: process.env.AI_MODEL, key: process.env.AI_KEY, baseUrl: process.env.AI_BASE || '' };
 const saveSubs = () => fs.writeFile(F_SUBS, JSON.stringify(subs), () => {});
 const saveCfg = () => fs.writeFile(F_CFG, JSON.stringify(cfg), () => {});
 
@@ -24,7 +27,7 @@ const log = (...a) => console.log(new Date().toISOString(), ...a);
 
 /* ------------------------------------------------------------------ Telegram */
 const TG_BASE = process.env.TG_API || 'https://api.telegram.org/';
-let TOKEN = cfg.botToken || process.env.BOT_TOKEN || '';
+let TOKEN = process.env.BOT_TOKEN || cfg.botToken || '';
 let botName = '', hook = '', webhookErr = '', mode = 'off';
 const hookOf = t => sha(t).slice(0, 24);
 
