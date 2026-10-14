@@ -10,13 +10,43 @@ const F_SUBS = path.join(DATA, 'subs.json'), F_CFG = path.join(DATA, 'config.jso
 const DEV_HASH = process.env.DEV_HASH || '07ae20918563b4a84e4458725d1b9f7296da63e3b51c1d5e23b7875462d078d4';
 
 const read = (f, d) => { try { return JSON.parse(fs.readFileSync(f, 'utf8')); } catch (e) { return d; } };
-let subs = read(F_SUBS, {});            // code -> [chat ids]
-let cfg = read(F_CFG, {});              // { botToken, ai:{provider,model,key,baseUrl} }
-// Free hosting has no disk, so settings can also come from environment variables (they survive restarts):
-// AI_PROVIDER (gemini|openai|anthropic), AI_MODEL, AI_KEY, AI_BASE (optional)
-if (process.env.AI_KEY && process.env.AI_MODEL) cfg.ai = { provider: process.env.AI_PROVIDER || 'gemini', model: process.env.AI_MODEL, key: process.env.AI_KEY, baseUrl: process.env.AI_BASE || '' };
-const saveSubs = () => fs.writeFile(F_SUBS, JSON.stringify(subs), () => {});
-const saveCfg = () => fs.writeFile(F_CFG, JSON.stringify(cfg), () => {});
+// ---- storage: a JSON file, or Upstash Redis (free) when UPSTASH_REDIS_REST_URL / _TOKEN are set.
+// Free hosting has no disk, so use Upstash to keep linked contacts, licenses and settings across restarts.
+const F_DB = path.join(DATA, 'db.json');
+const UP = { url: process.env.UPSTASH_REDIS_REST_URL || '', tok: process.env.UPSTASH_REDIS_REST_TOKEN || '' };
+let DB = { subs: {}, cfg: {}, lic: {}, keys: {}, claims: {}, utr: {}, usage: {}, admin: 0, adminTok: '' };
+let subs = DB.subs, cfg = DB.cfg, noSave = false;
+async function upCmd(cmd) {
+  const r = await fetch(UP.url, { method: 'POST', headers: { authorization: 'Bearer ' + UP.tok, 'content-type': 'application/json' }, body: JSON.stringify(cmd) });
+  const j = await r.json(); if (j.error) throw new Error(j.error); return j.result;
+}
+let saveT = null;
+function dbSave() {
+  if (noSave) return;
+  clearTimeout(saveT);
+  saveT = setTimeout(async () => {
+    const t = JSON.stringify(DB);
+    if (UP.url) { try { await upCmd(['SET', 'jashpi_db', t]); } catch (e) { console.log('save failed', e.message); } }
+    else fs.writeFile(F_DB, t, () => {});
+  }, 700);
+}
+const saveSubs = dbSave, saveCfg = dbSave;
+async function dbLoad() {
+  let d = null;
+  if (UP.url) {
+    for (let i = 0; i < 5 && !d; i++) {
+      try { const v = await upCmd(['GET', 'jashpi_db']); d = v ? JSON.parse(v) : {}; }
+      catch (e) { console.log('storage load failed, retrying:', e.message); await new Promise(r => setTimeout(r, 2000)); }
+    }
+    if (!d) { noSave = true; d = {}; console.log('STORAGE UNREACHABLE - running without saving to protect existing data'); }
+  } else d = read(F_DB, null) || { subs: read(F_SUBS, {}), cfg: read(F_CFG, {}) };
+  Object.assign(DB, d);
+  for (const k of ['subs', 'cfg', 'lic', 'keys', 'claims', 'utr', 'usage']) if (!DB[k] || typeof DB[k] !== 'object') DB[k] = {};
+  subs = DB.subs; cfg = DB.cfg;
+  // AI settings can also come from environment variables: AI_PROVIDER, AI_MODEL, AI_KEY, AI_BASE
+  if (process.env.AI_KEY && process.env.AI_MODEL) cfg.ai = { provider: process.env.AI_PROVIDER || 'gemini', model: process.env.AI_MODEL, key: process.env.AI_KEY, baseUrl: process.env.AI_BASE || '' };
+  TOKEN = process.env.BOT_TOKEN || cfg.botToken || '';
+}
 
 const sha = s => crypto.createHash('sha256').update(String(s)).digest('hex');
 const isDev = code => typeof code === 'string' && code.length > 6 && code.length < 80 &&
@@ -60,8 +90,12 @@ const seen = []; // dedupe update ids
 async function onUpdate(u) {
   log('update', u.update_id, Object.keys(u).filter(k => k !== 'update_id').join(','));
   if (u.update_id != null) { if (seen.includes(u.update_id)) return; seen.push(u.update_id); if (seen.length > 500) seen.shift(); }
-  const m = u.message || u.edited_message || (u.callback_query && u.callback_query.message);
-  if (u.callback_query) tg('answerCallbackQuery', { callback_query_id: u.callback_query.id }, 1);
+  if (u.callback_query) {
+    const cq = u.callback_query; tg('answerCallbackQuery', { callback_query_id: cq.id }, 1);
+    if (cq.from && DB.admin && cq.from.id === DB.admin && /^(ap|no):/.test(cq.data || '')) await adminDecide(cq.data);
+    return;
+  }
+  const m = u.message || u.edited_message;
   if (!m || !m.chat) return;
   if (u.edited_message && !u.edited_message.text) return;   // live-location edits from users: ignore silently
   const chat = m.chat.id, text = (m.text || '').trim();
@@ -70,6 +104,7 @@ async function onUpdate(u) {
   if (cmd) {
     const c = cmd[1].toLowerCase(), arg = (cmd[2] || '').trim();
     if (c === 'start') {
+      if (/^adm_[A-Z0-9]{12}$/.test(arg) && DB.adminTok && arg === 'adm_' + DB.adminTok) { DB.admin = chat; DB.adminTok = ''; dbSave(); return say(chat, '🔐 You are now the Jashpi admin. Payment claims will appear here with Approve / Reject buttons.'); }
       if (/^[a-z0-9]{16}$/.test(arg)) {
         subs[arg] = [...new Set([...(subs[arg] || []), chat])].slice(0, 20); saveSubs();
         return say(chat, '✅ Linked. You will now receive JASHPI safety alerts and live location from this person.\n\nSend /stop any time to unlink.');
@@ -84,6 +119,7 @@ async function onUpdate(u) {
   if (m.location) return say(chat, `📍 Got it: https://maps.google.com/?q=${m.location.latitude},${m.location.longitude}`);
   if (text) {
     if (!aiReady()) return say(chat, 'I am online ✅ (AI answers are not enabled yet). Send /help.');
+    if (!useQuota('tg' + chat, 'chat')) return say(chat, 'You have used today\'s free AI answers. Get Jashpi Premium in the app for more.');
     tg('sendChatAction', { chat_id: chat, action: 'typing' }, 1);
     try { return say(chat, await ai({ mode: 'chat', lang: 'en', messages: [{ role: 'user', content: text }] })); }
     catch (e) { return say(chat, '⚠ I could not answer right now. Please try again.'); }
@@ -174,6 +210,35 @@ async function ai({ mode: md, lang, messages, image }) {
   return (((j.choices || [])[0] || {}).message || {}).content || '';
 }
 
+/* ------------------------------------------------------------- premium / quotas */
+const DAY = 86400000;
+const PLAN = { free: { chat: 8, scan: 10, img: 2 }, pro: { chat: 200, scan: 150, img: 40 } };
+const rndS = n => Array.from(crypto.randomBytes(n), b => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[b % 32]).join('');
+const validDid = d => typeof d === 'string' && /^[a-z0-9]{8,40}$/i.test(d);
+const isPro = did => { const l = DB.lic[did]; return !!(l && l.until > Date.now()); };
+function grant(did, days) { const l = DB.lic[did] || (DB.lic[did] = { until: 0 }); l.until = Math.max(Date.now(), l.until) + days * DAY; dbSave(); return l.until; }
+function useQuota(did, kind) {
+  const day = new Date().toISOString().slice(0, 10);
+  let u = DB.usage[did]; if (!u || u.day !== day) u = DB.usage[did] = { day, chat: 0, scan: 0, img: 0 };
+  if (u[kind] >= (isPro(did) ? PLAN.pro : PLAN.free)[kind]) return false;
+  u[kind]++; dbSave(); return true;
+}
+const refund = (did, kind) => { const u = DB.usage[did]; if (u && u[kind] > 0) u[kind]--; };
+setInterval(() => { const day = new Date().toISOString().slice(0, 10); for (const k in DB.usage) if (DB.usage[k].day !== day) delete DB.usage[k]; dbSave(); }, 3600e3);
+const plans = () => { const p = cfg.pay || {}; return [{ id: 'm', name: 'Monthly', days: 30, price: Number(p.m) || 49 }, { id: 'y', name: 'Yearly', days: 365, price: Number(p.y) || 399 }]; };
+const upiLink = pl => { const p = cfg.pay || {}; return p.upi ? `upi://pay?pa=${encodeURIComponent(p.upi)}&pn=${encodeURIComponent(p.name || 'Jashpi')}&am=${pl.price}&cu=INR&tn=${encodeURIComponent('Jashpi Premium ' + pl.name)}` : ''; };
+async function notifyAdmin(c) {
+  if (!DB.admin) return;
+  const pl = plans().find(x => x.id === c.plan) || {};
+  await say(DB.admin, `💰 Payment claim #${c.id}\nPlan: ${pl.name} ₹${pl.price}\nUTR: ${c.utr}\nName: ${c.name || '-'}\n\nCheck the amount and UTR in your UPI app, then choose:`, { reply_markup: { inline_keyboard: [[{ text: '✅ Approve', callback_data: 'ap:' + c.id }, { text: '❌ Reject', callback_data: 'no:' + c.id }]] } });
+}
+async function adminDecide(data) {
+  const [act, id] = String(data).split(':'), c = DB.claims[id];
+  if (!c || c.status !== 'pending') return say(DB.admin, 'That claim was already handled.');
+  if (act === 'ap') { const pl = plans().find(x => x.id === c.plan) || { days: 30 }; const until = grant(c.d, pl.days); c.status = 'approved'; dbSave(); return say(DB.admin, `✅ Approved #${id}. Premium until ${new Date(until).toLocaleDateString('en-GB')}.`); }
+  c.status = 'rejected'; dbSave(); return say(DB.admin, `❌ Rejected #${id}.`);
+}
+
 /* ----------------------------------------------------------- SOS / live location */
 const tracks = {};   // id -> {lat,lng,name,t}
 const lives = {};    // id -> {msgs:[{chat,id}], last}
@@ -210,7 +275,7 @@ const send = (r, c, b, t = 'application/json') => {
 const body = (q, max = 3e6) => new Promise(res => { let d = ''; q.on('data', c => { d += c; if (d.length > max) q.destroy(); }); q.on('end', () => { try { res(JSON.parse(d || '{}')); } catch (e) { res({}); } }); q.on('error', () => res({})); });
 const esc = x => String(x).replace(/[&<>"']/g, '');
 
-http.createServer(async (q, s) => {
+const server = http.createServer(async (q, s) => {
   const u = new URL(q.url, 'http://x'), p = u.pathname;
   const ip = String(q.headers['x-forwarded-for'] || q.socket.remoteAddress).split(',')[0].trim();
   if (q.method === 'OPTIONS') return send(s, 204, '');
@@ -223,7 +288,8 @@ http.createServer(async (q, s) => {
       onUpdate(upd).catch(e => log('update error', e.message));
       return;
     }
-    if (limited(ip, p === '/ai' ? 20 : 60)) return send(s, 429, { error: 'slow down' });
+    // separate buckets so polling never blocks AI; generous because many phones share one carrier IP
+    if (limited(ip + (p === '/ai' ? '|ai' : '|gen'), p === '/ai' ? 60 : 400)) return send(s, 429, { error: 'slow down' });
 
     if (p === '/' ) return send(s, 200, '<meta name=viewport content="width=device-width"><body style="font:18px sans-serif;padding:24px">JASHPI relay is running ✅</body>', 'text/html');
     if (p === '/health' || p === '/info') return send(s, 200, { ok: true, bot: botName, mode, ai: aiReady(), webhookErr });
@@ -231,10 +297,37 @@ http.createServer(async (q, s) => {
     if (p === '/ai' && q.method === 'POST') {
       if (!aiReady()) return send(s, 503, { error: 'AI is not set up yet' });
       const b = await body(q, 6e6);
-      try { return send(s, 200, { text: await ai(b) }); }
-      catch (e) { return send(s, 502, { error: String(e.message).slice(0, 200) }); }
+      const did = validDid(b.did) ? b.did : 'ip' + ip.replace(/[^a-z0-9]/gi, '');
+      const kind = b.mode === 'scan' ? (b.image && b.image.data ? 'img' : 'scan') : 'chat';
+      if (!useQuota(did, kind)) return send(s, 402, { error: 'limit', pro: isPro(did) });
+      try { return send(s, 200, { text: await ai(b), pro: isPro(did) }); }
+      catch (e) { refund(did, kind); return send(s, 502, { error: String(e.message).slice(0, 200) }); }
     }
 
+    if (p === '/plans') {
+      const d = u.searchParams.get('d') || '', l = DB.lic[d];
+      const pend = Object.values(DB.claims).some(c => c.d === d && c.status === 'pending');
+      return send(s, 200, { pro: isPro(d), until: l ? l.until : 0, pending: pend, link: (cfg.pay || {}).link || '', canPay: !!((cfg.pay || {}).upi || (cfg.pay || {}).link), limits: PLAN,
+        plans: plans().map(x => ({ ...x, upi: upiLink(x) })) });
+    }
+    if (p === '/license/redeem' && q.method === 'POST') {
+      const b = await body(q); const key = String(b.key || '').trim().toUpperCase();
+      if (limited('rk' + ip, 6) || !validDid(b.d)) return send(s, 429, { error: 'slow down' });
+      const k = DB.keys[key];
+      if (!k || k.used) return send(s, 400, { error: 'Invalid or already used key' });
+      k.used = b.d; const until = grant(b.d, k.days); dbSave();
+      return send(s, 200, { ok: true, until });
+    }
+    if (p === '/pay/claim' && q.method === 'POST') {
+      const b = await body(q); const pl = plans().find(x => x.id === b.plan);
+      if (limited('pc' + ip, 5) || !validDid(b.d) || !pl) return send(s, 400, { error: 'bad request' });
+      const utr = String(b.utr || '').trim().toUpperCase();
+      if (!/^[A-Z0-9]{8,24}$/.test(utr)) return send(s, 400, { error: 'Enter the 12-digit UTR / transaction ID from your UPI app' });
+      if (DB.utr[utr]) return send(s, 400, { error: 'This payment ID was already submitted' });
+      const id = rndS(5), c = DB.claims[id] = { id, d: b.d, plan: pl.id, utr, name: String(b.name || '').slice(0, 40), t: Date.now(), status: 'pending' };
+      DB.utr[utr] = id; dbSave(); notifyAdmin(c);
+      return send(s, 200, { ok: true, id, adminSet: !!DB.admin });
+    }
     if (p.startsWith('/subs/')) { const i = subs[p.slice(6)] || []; return send(s, 200, { count: i.length }); }
 
     if (p === '/sos' && q.method === 'POST') {
@@ -277,7 +370,7 @@ http.createServer(async (q, s) => {
       const b = await body(q);
       if (limited('dev' + ip, 8) || !isDev(b.code)) return send(s, 403, { error: 'forbidden' });
       const whInfo = async () => { if (!TOKEN) return null; const r = await tg('getWebhookInfo', {}, 1); return r.ok ? { set: !!r.result.url, host: (() => { try { return new URL(r.result.url).hostname; } catch (e) { return ''; } })(), pending: r.result.pending_update_count, lastError: r.result.last_error_message || '' } : null; };
-      const out = async () => ({ ok: true, bot: botName, mode, botSet: !!TOKEN, webhookErr, webhook: await whInfo(), ai: { provider: (cfg.ai || {}).provider || '', model: (cfg.ai || {}).model || '', baseUrl: (cfg.ai || {}).baseUrl || '', keySet: !!(cfg.ai && cfg.ai.key) } });
+      const out = async () => ({ ok: true, pay: { upi: (cfg.pay || {}).upi || '', m: (cfg.pay || {}).m || 0, y: (cfg.pay || {}).y || 0, adminSet: !!DB.admin }, bot: botName, mode, botSet: !!TOKEN, webhookErr, webhook: await whInfo(), ai: { provider: (cfg.ai || {}).provider || '', model: (cfg.ai || {}).model || '', baseUrl: (cfg.ai || {}).baseUrl || '', keySet: !!(cfg.ai && cfg.ai.key) } });
       if (p === '/config/get') return send(s, 200, await out());
       let botRes = null;
       if (typeof b.botToken === 'string' && b.botToken.trim()) {
@@ -292,7 +385,16 @@ http.createServer(async (q, s) => {
         cfg.ai = { provider: ['gemini', 'openai', 'anthropic'].includes(a.provider) ? a.provider : (prev.provider || 'gemini'), model: String(a.model || prev.model || '').trim().slice(0, 100), baseUrl: String(a.baseUrl || '').trim().slice(0, 200), key: String(a.key || '').trim() || prev.key || '' };
         saveCfg();
       }
-      const res = { ...(await out()), botRes };
+      if (b.pay && typeof b.pay === 'object') {
+        const x = b.pay; cfg.pay = { upi: String(x.upi || '').trim().slice(0, 80), name: String(x.name || '').trim().slice(0, 40), m: Number(x.m) || 0, y: Number(x.y) || 0, link: String(x.link || '').trim().slice(0, 300) }; saveCfg();
+      }
+      const extra = {};
+      if (b.mkKey) { const n = Math.min(20, Math.max(1, Number(b.mkKey.count) || 1)), days = Math.min(3650, Math.max(1, Number(b.mkKey.days) || 30)); extra.keys = []; for (let i = 0; i < n; i++) { const k = 'JASH-' + rndS(4) + '-' + rndS(4) + '-' + rndS(4); DB.keys[k] = { days, used: false, t: Date.now() }; extra.keys.push(k + '  (' + days + ' days)'); } dbSave(); }
+      if (b.grant && validDid(b.grant.did)) { extra.grantedUntil = grant(b.grant.did, Math.min(3650, Number(b.grant.days) || 30)); }
+      if (b.adminLink) { DB.adminTok = rndS(12); dbSave(); extra.adminLink = botName ? `https://t.me/${botName}?start=adm_${DB.adminTok}` : 'bot not ready'; }
+      if (b.decide && DB.claims[b.decide.id]) { const was = DB.admin; DB.admin = DB.admin || 0; await adminDecide((b.decide.ok ? 'ap:' : 'no:') + b.decide.id); extra.decided = b.decide.id; DB.admin = was; }
+      if (b.claims) extra.claims = Object.values(DB.claims).filter(c => c.status === 'pending').map(c => `#${c.id} ${c.plan} UTR ${c.utr} ${c.name}`);
+      const res = { ...(await out()), botRes, ...extra, pay: { upi: (cfg.pay || {}).upi || '', m: (cfg.pay || {}).m || 0, y: (cfg.pay || {}).y || 0, adminSet: !!DB.admin } };
       if (b.test) {
         if (!aiReady()) res.aiTest = 'FAILED: AI is not set (model or key missing)';
         else { try { await ai({ mode: 'chat', lang: 'en', messages: [{ role: 'user', content: 'Say OK' }] }); res.aiTest = 'OK'; } catch (e) { res.aiTest = 'FAILED: ' + String(e.message).slice(0, 220); } }
@@ -311,4 +413,5 @@ http.createServer(async (q, s) => {
     }
     send(s, 404, { error: 'not found' });
   } catch (e) { log('server error', e); send(s, 500, { error: 'server' }); }
-}).listen(process.env.PORT || 3000, '0.0.0.0', () => { log('JASHPI relay listening'); bootBot(); });
+});
+dbLoad().then(() => server.listen(process.env.PORT || 3000, '0.0.0.0', () => { log('JASHPI relay listening', UP.url ? '(storage: Upstash)' : '(storage: file)'); bootBot(); }));
